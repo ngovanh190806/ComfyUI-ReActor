@@ -1,102 +1,51 @@
-import os
-import torch
-from torch import nn
-from copy import deepcopy
-import pathlib
+import numpy as np
 
-from r_facelib.utils import load_file_from_url
-from r_facelib.utils import download_pretrained_models
-from r_facelib.detection.yolov5face.models.common import Conv
-
-from .retinaface.retinaface import RetinaFace
-from .yolov5face.face_detector import YoloDetector
-
-
-def init_detection_model(model_name, half=False, device='cuda'):
-    if 'retinaface' in model_name:
-        model = init_retinaface_model(model_name, half, device)
-    elif 'YOLOv5' in model_name:
-        model = init_yolov5face_model(model_name, device)
-    else:
-        raise NotImplementedError(f'{model_name} is not implemented.')
-
-    return model
-
-
-def init_retinaface_model(model_name, half=False, device='cuda'):
-    if model_name == 'retinaface_resnet50':
-        model = RetinaFace(network_name='resnet50', half=half)
-        model_url = 'https://github.com/xinntao/facexlib/releases/download/v0.1.0/detection_Resnet50_Final.pth'
-    elif model_name == 'retinaface_mobile0.25':
-        model = RetinaFace(network_name='mobile0.25', half=half)
-        model_url = 'https://github.com/xinntao/facexlib/releases/download/v0.1.0/detection_mobilenet0.25_Final.pth'
-    else:
-        raise NotImplementedError(f'{model_name} is not implemented.')
-
-    model_path = load_file_from_url(url=model_url, model_dir='../../models/facedetection', progress=True, file_name=None)
-    load_net = torch.load(model_path, map_location=lambda storage, loc: storage)
-    # remove unnecessary 'module.'
-    for k, v in deepcopy(load_net).items():
-        if k.startswith('module.'):
-            load_net[k[7:]] = v
-            load_net.pop(k)
-    model.load_state_dict(load_net, strict=True)
-    model.eval()
-    model = model.to(device)
-
-    return model
-
-
-def init_yolov5face_model(model_name, device='cuda'):
-    current_dir = str(pathlib.Path(__file__).parent.resolve())
-    if model_name == 'YOLOv5l':
-        model = YoloDetector(config_name=current_dir+'/yolov5face/models/yolov5l.yaml', device=device)
-        model_url = 'https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/yolov5l-face.pth'
-    elif model_name == 'YOLOv5n':
-        model = YoloDetector(config_name=current_dir+'/yolov5face/models/yolov5n.yaml', device=device)
-        model_url = 'https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/yolov5n-face.pth'
-    else:
-        raise NotImplementedError(f'{model_name} is not implemented.')
+class HybridDetectorWrapper:
+    def __init__(self):
+        # Móc nối trực tiếp vào bộ nhớ Hybrid đang chạy của ReActor Swapper
+        # Việc import bên trong __init__ giúp tránh lỗi Circular Import
+        from scripts.reactor_swapper import getAnalysisModel
+        self.analyzer = getAnalysisModel((640, 640))
+        
+    def __call__(self, img, *args, **kwargs):
+        # Lấy threshold từ cấu hình truyền vào (nếu có), mặc định 0.5
+        conf_threshold = kwargs.get('conf_threshold', 0.5)
+        if len(args) > 0:
+            # Xử lý trường hợp args truyền vào là tuple (thường gặp trong facexlib)
+            conf_threshold = args[0] if isinstance(args, (list, tuple)) else args
+            
+        # img được FaceRestoreHelper đưa vào dạng BGR array chuẩn
+        faces = self.analyzer.get(img)
+        bboxes = []
+        landmarks = []
+        
+        for face in faces:
+            if face.det_score >= conf_threshold:
+                # Đóng gói theo chuẩn format mà FaceRestoreHelper cần (x1, y1, x2, y2, score)
+                bboxes.append(np.append(face.bbox, face.det_score))
+                landmarks.append(face.kps)
+                
+        if len(bboxes) == 0:
+            # Trả về mảng rỗng tương thích với định dạng của Facexlib
+            return np.zeros((0, 5), dtype=np.float32), np.zeros((0, 5, 2), dtype=np.float32)
+            
+        return np.array(bboxes, dtype=np.float32), np.array(landmarks, dtype=np.float32)
     
-    model_path = load_file_from_url(url=model_url, model_dir='../../models/facedetection', progress=True, file_name=None)
-    load_net = torch.load(model_path, map_location=lambda storage, loc: storage)
-    model.detector.load_state_dict(load_net, strict=True)
-    model.detector.eval()
-    model.detector = model.detector.to(device).float()
+    def detect_faces(self, img, *args, **kwargs):
+        return self.__call__(img, *args, **kwargs)
+        
+    # Tạo các hàm giả lập (dummy) để chống lỗi AttributeError khi facexlib gọi Pytorch functions
+    def eval(self): return self
+    def to(self, *args, **kwargs): return self
+    def float(self): return self
+    def half(self): return self
+    def cpu(self): return self
+    def cuda(self): return self
 
-    for m in model.detector.modules():
-        if type(m) in [nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU]:
-            m.inplace = True  # pytorch 1.7.0 compatibility
-        elif isinstance(m, Conv):
-            m._non_persistent_buffers_set = set()  # pytorch 1.6.0 compatibility
-
-    return model
-
-
-# Download from Google Drive
-# def init_yolov5face_model(model_name, device='cuda'):
-#     if model_name == 'YOLOv5l':
-#         model = YoloDetector(config_name='facelib/detection/yolov5face/models/yolov5l.yaml', device=device)
-#         f_id = {'yolov5l-face.pth': '131578zMA6B2x8VQHyHfa6GEPtulMCNzV'}
-#     elif model_name == 'YOLOv5n':
-#         model = YoloDetector(config_name='facelib/detection/yolov5face/models/yolov5n.yaml', device=device)
-#         f_id = {'yolov5n-face.pth': '1fhcpFvWZqghpGXjYPIne2sw1Fy4yhw6o'}
-#     else:
-#         raise NotImplementedError(f'{model_name} is not implemented.')
-
-#     model_path = os.path.join('../../models/facedetection', list(f_id.keys())[0])
-#     if not os.path.exists(model_path):
-#         download_pretrained_models(file_ids=f_id, save_path_root='../../models/facedetection')
-
-#     load_net = torch.load(model_path, map_location=lambda storage, loc: storage)
-#     model.detector.load_state_dict(load_net, strict=True)
-#     model.detector.eval()
-#     model.detector = model.detector.to(device).float()
-
-#     for m in model.detector.modules():
-#         if type(m) in [nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU]:
-#             m.inplace = True  # pytorch 1.7.0 compatibility
-#         elif isinstance(m, Conv):
-#             m._non_persistent_buffers_set = set()  # pytorch 1.6.0 compatibility
-
-#     return model
+def init_detection_model(model_name, *args, **kwargs):
+    """
+    Hàm khởi tạo ghi đè: Bỏ qua RetinaFace/YOLO, ép 100% Face Restorer 
+    dùng chung lõi Hybrid đang chạy của ReActor.
+    """
+    print(f"[Face Restore] Đã chặn tải model {model_name} cũ. Ép sử dụng 100% lõi Hybrid_AntelopeV2 trên RAM!")
+    return HybridDetectorWrapper()
