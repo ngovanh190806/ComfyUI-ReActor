@@ -44,24 +44,11 @@ except Exception as e:
     logger.debug(f"ExecutionProviderError: {e}.\nEP is set to CPU.")
     providers = ["CPUExecutionProvider"]
 
-models_path_old = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
-insightface_path_old = os.path.join(models_path_old, "insightface")
-insightface_models_path_old = os.path.join(insightface_path_old, "models")
-
 models_path = folder_paths.models_dir
 insightface_path = os.path.join(models_path, "insightface")
 insightface_models_path = os.path.join(insightface_path, "models")
 reswapper_path = os.path.join(models_path, "reswapper")
 hyperswap_path = os.path.join(models_path, "hyperswap")
-
-if os.path.exists(models_path_old):
-    move_path(insightface_models_path_old, insightface_models_path)
-    move_path(insightface_path_old, insightface_path)
-    move_path(models_path_old, models_path)
-if os.path.exists(insightface_path) and os.path.exists(insightface_path_old):
-    shutil.rmtree(insightface_path_old)
-    shutil.rmtree(models_path_old)
-
 
 FS_MODEL = None
 CURRENT_FS_MODEL_PATH = None
@@ -93,13 +80,22 @@ def get_current_faces_model():
     global SOURCE_FACES
     return SOURCE_FACES
 
-def getAnalysisModel(det_size = (640, 640)):
+def getAnalysisModel(det_size=(640, 640)):
     global ANALYSIS_MODELS
+    # Ép cứng det_size về (640, 640) để ngăn hệ thống tự nhảy về 320x320
+    det_size = (640, 640)
+    
     ANALYSIS_MODEL = ANALYSIS_MODELS[str(det_size[0])]
     if ANALYSIS_MODEL is None:
+        # Ép cứng name="antelopev2" và sử dụng cấu hình Hybrid trong class ReActorFaceAnalysis
+        # Lưu ý: Class ReActorFaceAnalysis cần được cập nhật logic override Recognition
         ANALYSIS_MODEL = ReActorFaceAnalysis(
-            name="buffalo_l", providers=providers, root=insightface_path
+            name="antelopev2", 
+            providers=providers, 
+            root=insightface_path
         )
+    
+    # Ép cứng chuẩn bị det_size tại đây
     ANALYSIS_MODEL.prepare(ctx_id=0, det_size=det_size)
     ANALYSIS_MODELS[str(det_size[0])] = ANALYSIS_MODEL
     return ANALYSIS_MODEL
@@ -111,10 +107,10 @@ def getFaceSwapModel(model_path: str):
         FS_MODEL = unload_model(FS_MODEL)
 
         model_filename = os.path.basename(model_path)
-        if "hyperswap" in model_filename.lower(): # Если это Hyperswap
+        if "hyperswap" in model_filename.lower(): 
             model_path = os.path.join(folder_paths.models_dir, "hyperswap", model_filename)
             FS_MODEL = HyperSwapper(model_path, providers=providers)
-        else: # Если это INSwapper / Reswapper
+        else: 
             if "reswapper" in model_filename.lower():
                 model_path = os.path.join(folder_paths.models_dir, "reswapper", model_filename)
             FS_MODEL = INSwapper(model_path, providers=providers)
