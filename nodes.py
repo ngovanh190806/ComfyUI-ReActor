@@ -1,5 +1,6 @@
 import os, glob, sys
 import logging
+import json
 
 import torch
 import torch.nn.functional as F
@@ -11,7 +12,7 @@ import onnxruntime
 import numpy as np
 import cv2
 import math
-from typing import List
+from typing import List, Tuple, Optional, Any
 from PIL import Image
 import io
 from scipy import stats
@@ -25,19 +26,26 @@ import comfy.model_management as model_management
 import comfy.utils
 import folder_paths
 
-import scripts.reactor_version
-from r_chainner import model_loading
-from scripts.reactor_faceswap import (
-    FaceSwapScript,
-    get_models,
-    get_current_faces_model,
-    analyze_faces,
-    half_det_size,
-    providers
-)
+# --- KHẮC PHỤC DỨT ĐIỂM LỖI IMPORT & NAMESPACE ---
+def get_models():
+    swappers = ["insightface", "reswapper", "hyperswap"]
+    models_list = []
+    for folder in swappers:
+        models_folder = folder + "/*"
+        models_path = os.path.join(folder_paths.models_dir, models_folder)
+        models = glob.glob(models_path)
+        models = [x for x in models if x.endswith(".onnx") or x.endswith(".pth")]
+        models_list.extend(models)
+    return models_list
+
 from scripts.reactor_swapper import (
     unload_all_models,
+    analyze_faces,
+    get_current_faces_model,
+    providers,
+    half_det_size
 )
+
 from scripts.reactor_logger import logger
 from reactor_utils import (
     batch_tensor_to_pil,
@@ -63,7 +71,6 @@ import scripts.r_archs.codeformer_arch
 import scripts.r_masking.subcore as subcore
 import scripts.r_masking.core as core
 import scripts.r_masking.segs as masking_segs
-
 import scripts.reactor_sfw as sfw
 
 
@@ -159,7 +166,7 @@ class reactor:
                 "enabled": ("BOOLEAN", {"default": True, "label_off": "OFF", "label_on": "ON"}),
                 "input_image": ("IMAGE",),
                 "swap_model": (list(model_names().keys()),),
-                "facedetection": (["retinaface_resnet50", "retinaface_mobile0.25", "YOLOv5l", "YOLOv5n"],),
+                "facedetection": (["hybrid_antelopev2"], {"default": "hybrid_antelopev2"}),
                 "face_restore_model": (get_model_names(get_restorers),),
                 "face_restore_visibility": ("FLOAT", {"default": 1, "min": 0.1, "max": 1, "step": 0.05}),
                 "codeformer_weight": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1, "step": 0.05}),
@@ -435,17 +442,12 @@ class reactor:
             faces_order = self.faces_order
 
         apply_log_level(console_log_level)
+        if not enabled: return (input_image, face_model)
 
-        if not enabled:
-            return (input_image,face_model)
-        elif source_image is None and face_model is None:
-            logger.error("Please provide 'source_image' or `face_model`")
-            return (input_image,face_model)
-
-        if face_model == "none":
-            face_model = None
-
-        script = FaceSwapScript()
+        # THAY THẾ FaceSwapScript: 
+        # Gọi trực tiếp hàm swap_face từ module reactor_swapper
+        from scripts.reactor_swapper import swap_face
+        
         pil_images = batch_tensor_to_pil(input_image)
 
         # NSFW checker
@@ -527,7 +529,7 @@ class ReActorPlusOpt:
                 "enabled": ("BOOLEAN", {"default": True, "label_off": "OFF", "label_on": "ON"}),
                 "input_image": ("IMAGE",),
                 "swap_model": (list(model_names().keys()),),
-                "facedetection": (["retinaface_resnet50", "retinaface_mobile0.25", "YOLOv5l", "YOLOv5n"],),
+                "facedetection": (["hybrid_antelopev2"], {"default": "hybrid_antelopev2"}),
                 "face_restore_model": (get_model_names(get_restorers),),
                 "face_restore_visibility": ("FLOAT", {"default": 1, "min": 0.1, "max": 1, "step": 0.05}),
                 "codeformer_weight": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1, "step": 0.05}),
@@ -592,6 +594,9 @@ class LoadFaceModel:
         return {
             "required": {
                 "face_model": (get_model_names(get_facemodels),),
+            },
+            "optional": {
+                "random_choice": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -600,16 +605,18 @@ class LoadFaceModel:
     FUNCTION = "load_model"
     CATEGORY = "🌌 ReActor"
 
-    def load_model(self, face_model):
+    def load_model(self, face_model, random_choice=False):
         self.face_model = face_model
-        face_model = face_model.split(".safetensors")[0] if ".safetensors" in face_model else face_model
+        face_model_name = face_model.split(".safetensors")[0] if ".safetensors" in face_model else face_model
         self.face_models_path = FACE_MODELS_PATH
+        
+        out = None
         if self.face_model != "none":
             face_model_path = os.path.join(self.face_models_path, self.face_model)
             out = load_face_model(face_model_path)
-        else:
-            out = None
-        return (out,face_model)
+            if random_choice and hasattr(out, 'metadata'):
+                logger.status(f"Metadata detected for {face_model_name}")
+        return (out, face_model_name)
 
 
 class ReActorWeight:
@@ -898,7 +905,7 @@ class RestoreFace:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "facedetection": (["retinaface_resnet50", "retinaface_mobile0.25", "YOLOv5l", "YOLOv5n", "scrfd"],),
+                "facedetection": (["hybrid_antelopev2"], {"default": "hybrid_antelopev2"}),
                 "model": (get_model_names(get_restorers),),
                 "visibility": ("FLOAT", {"default": 1, "min": 0.0, "max": 1, "step": 0.05}),
                 "codeformer_weight": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1, "step": 0.05}),
@@ -922,7 +929,7 @@ class RestoreFaceAdvanced:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "facedetection": (["retinaface_resnet50", "retinaface_mobile0.25", "YOLOv5l", "YOLOv5n"],),
+                "facedetection": (["hybrid_antelopev2"], {"default": "hybrid_antelopev2"}),
                 "model": (get_model_names(get_restorers),),
                 "visibility": ("FLOAT", {"default": 1, "min": 0.0, "max": 1, "step": 0.05}),
                 "codeformer_weight": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1, "step": 0.05}),
