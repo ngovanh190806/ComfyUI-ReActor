@@ -1,103 +1,74 @@
 import os
+import sys
+import subprocess
 import zipfile
-from reactor_utils import download  # Твоя функция скачивания из utils
-from .face_objects import Face
-from .inswap import SCRFD, ArcFaceONNX, Attribute, Landmark
+import urllib.request
+import folder_paths
 from scripts.reactor_logger import logger
+from insightface.model_zoo import model_zoo
 
-class ReActorFaceAnalysis:
+# Tự động kiểm tra và cài đặt thư viện insightface nếu hệ thống báo thiếu
+try:
+    import insightface
+except ImportError:
+    print("[ReActor] Thiếu module 'insightface'. Đang tiến hành cài đặt tự động...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "insightface"])
+
+from insightface.app import FaceAnalysis
+
+# Xác định đường dẫn gốc
+INSIGHTFACE_DIR = os.path.join(folder_paths.models_dir, "insightface")
+ANTELOPEV2_DIR = os.path.join(INSIGHTFACE_DIR, "models", "antelopev2")
+BUFFALO_L_DIR = os.path.join(INSIGHTFACE_DIR, "models", "buffalo_l")
+ANTELOPEV2_URL = "https://github.com/deepinsight/insightface/releases/download/v0.7/antelopev2.zip"
+
+class ReActorFaceAnalysis(FaceAnalysis):
     """
-    Главный класс-оркестратор. 
-    Берет картинку, находит лица, определяет пол/возраст и вычисляет эмбеддинги.
+    Class quản lý nhận diện khuôn mặt thừa kế từ FaceAnalysis.
+    Sử dụng antelopev2 làm mặc định và ghi đè recognition bằng buffalo_l.
     """
-    def __init__(self, name="buffalo_l", root="./models/insightface", providers=None):
-        self.name = name
+    def __init__(self, name='antelopev2', root=INSIGHTFACE_DIR, allowed_modules=None, providers=None, **kwargs):
         self.root = root
         self.providers = providers or ["CPUExecutionProvider"]
-        self.models = {}
+        
+        # Tự động tải antelopev2 nếu chưa tồn tại
+        self._prepare_antelopev2()
+        
+        # 1. Khởi tạo toàn bộ pipeline bằng antelopev2
+        super().__init__(name=name, root=root, allowed_modules=allowed_modules, providers=self.providers, **kwargs)
+        
+        # 2. Ghi đè (override) mô hình recognition bằng w600k_r50.onnx của buffalo_l
+        rec_model_path = os.path.join(BUFFALO_L_DIR, 'w600k_r50.onnx')
+        
+        if os.path.exists(rec_model_path):
+            logger.status("[ReActor] Đang ghi đè Recognition Model bằng buffalo_l/w600k_r50...")
+            rec_model = model_zoo.get_model(rec_model_path, providers=self.providers)
+            self.models['recognition'] = rec_model
+        else:
+            logger.error("[ReActor] CẢNH BÁO: Không tìm thấy w600k_r50.onnx trong buffalo_l, inswapper có thể bị nhòe lỗi!")
 
-        model_dir = os.path.join(root, "models", name)
-        os.makedirs(model_dir, exist_ok=True)
-
-        det_file = os.path.join(model_dir, "det_10g.onnx")
-        rec_file = os.path.join(model_dir, "w600k_r50.onnx")
-        attr_file = os.path.join(model_dir, "genderage.onnx")
-        lmk2d_file = os.path.join(model_dir, "2d106det.onnx")
-        lmk3d_file = os.path.join(model_dir, "1k3d68.onnx")
-
-        # Если файлов нет - качаем архив
-        if not (os.path.exists(det_file) and os.path.exists(rec_file) and os.path.exists(attr_file)):
-            zip_url = "https://huggingface.co/datasets/Gourieff/ReActor/resolve/main/models/buffalo_l.zip"
-            zip_path = os.path.join(model_dir, f"{name}.zip")
-
-            logger.status(f"Downloading {name} models archive...")
-            download(zip_url, zip_path, f"{name}.zip")
-
-            logger.status(f"Extracting {name} models...")
-            try:
-                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                    zip_ref.extractall(model_dir)
-                logger.status("Extraction completed!")
-            except zipfile.BadZipFile:
-                logger.error("Downloaded zip file is corrupted. Please try again.")
-            finally:
-                # В любом случае пытаемся удалить архив, чтобы не занимать место
-                if os.path.exists(zip_path):
-                    os.remove(zip_path)
-
-        # Инициализируем только те модели, которые физически есть в папке
-        if os.path.exists(det_file):
-            self.models["detection"] = SCRFD(det_file, providers=self.providers)
-        if os.path.exists(rec_file):
-            self.models["recognition"] = ArcFaceONNX(rec_file, providers=self.providers)
-        if os.path.exists(attr_file):
-            self.models["attribute"] = Attribute(attr_file, providers=self.providers)
-        if os.path.exists(lmk2d_file):
-            self.models["landmark_2d"] = Landmark(lmk2d_file, providers=self.providers)
-        if os.path.exists(lmk3d_file):
-            self.models["landmark_3d"] = Landmark(lmk3d_file, providers=self.providers)
-
-        if "detection" not in self.models:
-            raise FileNotFoundError(
-                f"Detection model (det_10g.onnx) not found at {det_file}. "
-                "Please ensure the buffalo_l models are downloaded and extracted properly."
-            )
+    def _prepare_antelopev2(self):
+        if not os.path.exists(ANTELOPEV2_DIR):
+            logger.status(f"[ReActor] Không tìm thấy antelopev2. Đang tự động tải...")
+            os.makedirs(os.path.join(self.root, "models"), exist_ok=True)
+            zip_path = os.path.join(self.root, "models", "antelopev2.zip")
+            
+            urllib.request.urlretrieve(ANTELOPEV2_URL, zip_path)
+            
+            logger.status(f"[ReActor] Đang giải nén antelopev2...")
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(os.path.join(self.root, "models"))
+            
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+            logger.status("[ReActor] Tải và giải nén hoàn tất.")
 
     def prepare(self, ctx_id=0, det_size=(640, 640), det_thresh=0.5):
-        self.det_size = det_size
         self.det_thresh = det_thresh
+        super().prepare(ctx_id=ctx_id, det_size=det_size)
 
     def get(self, img, max_num=0):
-        bboxes, kpss = self.models["detection"].detect(
-            img, 
-            det_thresh=self.det_thresh, 
-            input_size=self.det_size, 
-            max_num=max_num
-        )
-        
-        if bboxes.shape[0] == 0:
-            return []
-
-        ret = []
-        for i in range(bboxes.shape[0]):
-            bbox = bboxes[i, 0:4]
-            det_score = bboxes[i, 4]
-            kps = kpss[i] if kpss is not None else None
-            
-            face = Face(bbox=bbox, kps=kps, det_score=det_score)
-
-            if "attribute" in self.models:
-                self.models["attribute"].get(img, face)
-            
-            if "recognition" in self.models:
-                self.models["recognition"].get(img, face)
-            
-            if "landmark_2d" in self.models:
-                self.models["landmark_2d"].get(img, face)
-                
-            if "landmark_3d" in self.models:
-                self.models["landmark_3d"].get(img, face)
-                
-            ret.append(face)
-            
-        return ret
+        faces = super().get(img, max_num=max_num)
+        if hasattr(self, 'det_thresh') and self.det_thresh > 0:
+            faces = [f for f in faces if f.det_score >= self.det_thresh]
+        return faces
