@@ -6,7 +6,7 @@ from torchvision.transforms.functional import normalize
 
 # Import Hybrid Analyzer mới
 import folder_paths
-from reactor_core.analyzer import ReActorFaceAnalysis
+from scripts.reactor_swapper import getAnalysisModel
 
 from r_facelib.parsing import init_parsing_model
 from r_facelib.utils.misc import img2tensor, imwrite
@@ -49,22 +49,22 @@ def get_center_face(det_faces, h=0, w=0, center=None):
 
 
 class FaceRestoreHelper(object):
-    """Helper for the face restoration pipeline (base class)."""
+    """Helper for the face restoration pipeline using ReActor Hybrid Analyzer."""
 
     def __init__(self,
                  upscale_factor,
                  face_size=512,
                  crop_ratio=(1, 1),
-                 det_model='retinaface_resnet50', # Tham số giữ lại để tương thích nhưng sẽ bị bỏ qua
+                 det_model='retinaface_resnet50', # Tham số này bị bỏ qua
                  save_ext='png',
                  template_3points=False,
                  pad_blur=False,
                  use_parse=False,
                  device=None):
+        
         self.template_3points = template_3points 
         self.upscale_factor = upscale_factor
         self.crop_ratio = crop_ratio
-        assert (self.crop_ratio[0] >= 1 and self.crop_ratio[1] >= 1), 'crop ration only supports >=1'
         self.face_size = (int(face_size * self.crop_ratio[1]), int(face_size * self.crop_ratio[0]))
 
         # Cấu hình template khuôn mặt
@@ -79,6 +79,7 @@ class FaceRestoreHelper(object):
             self.face_template[:, 1] += face_size * (self.crop_ratio[0] - 1) / 2
         if self.crop_ratio[1] > 1:
             self.face_template[:, 0] += face_size * (self.crop_ratio[1] - 1) / 2
+            
         self.save_ext = save_ext
         self.pad_blur = pad_blur
         self.all_landmarks_5 = []
@@ -89,99 +90,80 @@ class FaceRestoreHelper(object):
         self.restored_faces = []
         self.pad_input_imgs = []
 
-        if device is None:
-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        else:
-            self.device = device
+        self.device = device if device is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        # BẮT BUỘC KHỞI TẠO HYBRID ANALYZER
-        insightface_dir = os.path.join(folder_paths.models_dir, "insightface")
-        self.analyzer = ReActorFaceAnalysis(name='antelopev2', root=insightface_dir, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-        self.analyzer.prepare(ctx_id=0, det_size=(640, 640))
+        # --- ÉP SỬ DỤNG HYBRID ANALYZER TỪ REACTOR ---
+        # Không khởi tạo lại analyzer, dùng getAnalysisModel để lấy instance đã cache
+        self.analyzer = getAnalysisModel((640, 640))
 
         # init face parsing model
         self.use_parse = use_parse
         self.face_parse = init_parsing_model(model_name='parsenet', device=self.device)
 
-    def set_upscale_factor(self, upscale_factor):
-        self.upscale_factor = upscale_factor
-
     def read_image(self, img):
-        """img can be image path or cv2 loaded image."""
-        # self.input_img is Numpy array, (h, w, c), BGR, uint8, [0, 255]
         if isinstance(img, str):
             img = cv2.imread(img)
-
-        if np.max(img) > 256:  # 16-bit image
-            img = img / 65535 * 255
-        if len(img.shape) == 2:  # gray image
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        elif img.shape[2] == 4:  # BGRA image with alpha channel
-            img = img[:, :, 0:3]
-
+        if np.max(img) > 256: img = img / 65535 * 255
+        if len(img.shape) == 2: img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        elif img.shape[2] == 4: img = img[:, :, 0:3]
         self.input_img = img
-
-        if min(self.input_img.shape[:2])<512:
-            f = 512.0/min(self.input_img.shape[:2])
+        if min(self.input_img.shape[:2]) < 512:
+            f = 512.0 / min(self.input_img.shape[:2])
             self.input_img = cv2.resize(self.input_img, (0,0), fx=f, fy=f, interpolation=cv2.INTER_LINEAR)
 
     def get_face_landmarks_5(self, only_keep_largest=False, only_center_face=False, resize=None, blur_ratio=0.01, eye_dist_threshold=None):
         self.all_landmarks_5 = []
         self.det_faces = []
         
-        for img in [self.input_img]: # Hỗ trợ xử lý input_img hiện tại
-            if resize is None:
-                scale = 1
-            else:
-                h, w = img.shape[:2]
-                scale = resize / min(h, w)
-                scale = max(1, scale)
-                img = cv2.resize(img, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+        img = self.input_img
+        if resize:
+            h, w = img.shape[:2]
+            scale = resize / min(h, w)
+            scale = max(1, scale)
+            img = cv2.resize(img, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+        else:
+            scale = 1
 
-            # --- SỬ DỤNG HYBRID ANALYZER ĐỂ LẤY KẾT QUẢ ---
-            faces = self.analyzer.get(img)
-            
-            if len(faces) == 0:
-                self.det_faces.append(np.array([]))
-                self.all_landmarks_5.append(np.array([]))
-                continue
-
-            bboxes = []
-            landmarks = []
-            for face in faces:
-                # face.bbox là [x1, y1, x2, y2], face.det_score là score
-                bboxes.append(np.append(face.bbox, face.det_score) / scale)
-                landmarks.append(face.kps / scale)
-
-            self.det_faces = np.array(bboxes)
-            self.all_landmarks_5 = list(landmarks)
-            
-            # --- XỬ LÝ LOGIC CHỌN MẶT LỚN NHẤT / TRUNG TÂM ---
-            if only_keep_largest:
-                h, w = self.input_img.shape[:2]
-                largest_face, idx = get_largest_face(self.det_faces, h, w)
-                self.det_faces = [largest_face]
-                self.all_landmarks_5 = [self.all_landmarks_5[idx]]
-            elif only_center_face:
-                h, w = self.input_img.shape[:2]
-                center_face, idx = get_center_face(self.det_faces, h, w)
-                self.det_faces = [center_face]
-                self.all_landmarks_5 = [self.all_landmarks_5[idx]]
+        # Lấy kết quả từ Hybrid Analyzer
+        faces = self.analyzer.get(img)
         
-        # ... (Giữ nguyên logic pad_blur và các phần sau đó của hàm cũ)
+        if len(faces) == 0:
+            return 0
+
+        # Lưu lại để xử lý logic filter
+        bboxes = []
+        landmarks = []
+        for face in faces:
+            bboxes.append(np.append(face.bbox, face.det_score) / scale)
+            landmarks.append(face.kps / scale)
+
+        self.det_faces = np.array(bboxes)
+        self.all_landmarks_5 = list(landmarks)
+            
+        # Logic chọn mặt
+        if only_keep_largest:
+            largest_face, idx = get_largest_face(self.det_faces, *self.input_img.shape[:2])
+            self.det_faces, self.all_landmarks_5 = [largest_face], [self.all_landmarks_5[idx]]
+        elif only_center_face:
+            center_face, idx = get_center_face(self.det_faces, *self.input_img.shape[:2])
+            self.det_faces, self.all_landmarks_5 = [center_face], [self.all_landmarks_5[idx]]
+            
         return len(self.all_landmarks_5)
 
     def align_warp_face(self, save_cropped_path=None, border_mode='constant'):
-        """Align and warp faces with face template.
-        """
-        if self.pad_blur:
-            assert len(self.pad_input_imgs) == len(
-                self.all_landmarks_5), f'Mismatched samples: {len(self.pad_input_imgs)} and {len(self.all_landmarks_5)}'
+        """Align và sửa lỗi landmark 68 -> 5 điểm nếu cần."""
         for idx, landmark in enumerate(self.all_landmarks_5):
-            # use 5 landmarks to get affine matrix
-            # use cv2.LMEDS method for the equivalence to skimage transform
-            # ref: https://blog.csdn.net/yichxi/article/details/115827338
-            affine_matrix = cv2.estimateAffinePartial2D(landmark, self.face_template, method=cv2.LMEDS)[0]
+            if landmark is None or len(landmark) == 0: continue
+            
+            # Nếu nhận được 68 điểm từ AntelopeV2, quy đổi về 5 điểm cho cv2.estimateAffinePartial2D
+            pts = np.array(landmark, dtype=np.float32)
+            if pts.shape == (68, 2):
+                pts = np.array([
+                    np.mean(pts[36:42], axis=0), np.mean(pts[42:48], axis=0), 
+                    pts[30], pts[48], pts[54]
+                ], dtype=np.float32)
+
+            affine_matrix = cv2.estimateAffinePartial2D(pts, self.face_template, method=cv2.LMEDS)[0]
             self.affine_matrices.append(affine_matrix)
             # warp and crop faces
             if border_mode == 'constant':
